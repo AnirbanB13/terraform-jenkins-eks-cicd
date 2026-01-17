@@ -1,275 +1,227 @@
-## Table of contents
+# terraform-jenkins-eks-cicd
+Automated, reproducible infrastructure as code (IaC) to deploy Jenkins on AWS EKS with a CI/CD pipeline using Terraform, Helm, and Kubernetes.
 
-- [Repository layout](#repository-layout)
-- [Architecture overview](#architecture-overview)
-- [Prerequisites](#prerequisites)
-- [Important files and what they do](#important-files-and-what-they-do)
-- [Quick start — Jenkins EC2 deployment](#quick-start---jenkins-ec2-deployment)
-- [Quick start — EKS cluster deployment](#quick-start---eks-cluster-deployment)
-- [Common Terraform commands](#common-terraform-commands)
-- [Variables and customization](#variables-and-customization)
-- [Backends and state](#backends-and-state)
-- [Security, costs, and cleanup](#security-costs-and-cleanup)
-- [Troubleshooting and tips](#troubleshooting-and-tips)
-- [Next steps / Recommendations](#next-steps--recommendations)
-- [Contributing](#contributing)
-- [License & contact](#license--contact)
+[![Terraform](https://img.shields.io/badge/Terraform-%233452A6.svg?style=flat&logo=terraform&logoColor=white)](https://www.terraform.io/)
+[![AWS](https://img.shields.io/badge/AWS-%23232F3E.svg?style=flat&logo=amazon-aws&logoColor=white)](https://aws.amazon.com/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-%23326CE5.svg?style=flat&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Jenkins](https://img.shields.io/badge/Jenkins-%23D24939.svg?style=flat&logo=jenkins&logoColor=white)](https://www.jenkins.io/)
+[![Helm](https://img.shields.io/badge/Helm-%23FF6C37.svg?style=flat&logo=helm&logoColor=white)](https://helm.sh/)
 
 ---
 
-## Repository layout
+A complete Terraform-based automation to provision:
+- VPC, networking and security groups
+- EKS cluster and managed node groups (or Fargate profile)
+- IAM roles and policies
+- ECR repositories (optional)
+- Helm release for Jenkins (configured for running builds on Kubernetes agents)
+- Basic Jenkins configuration seeding (credentials, plugins, jobs) via configuration-as-code or init containers
 
-- terraform_jenkins_eks/
-  - `provider.tf` — AWS provider config and version (aws = 6.28.0)
-  - `backend.tf` — S3 backend configuration (bucket: `terraform-jenkins-eks-project`, key: `jenkins/terraform.tfstate`)
-  - `main.tf` — VPC + Security Group + EC2 instance (Jenkins) modules and resource definitions
-  - `variables.tf` — variables for Jenkins configuration (vpc_cidr, public_subnets, instance_type)
-  - `terraform.tfvars` — example var values for Jenkins stack
-  - `jenkins-install.sh` — user-data script used to install Jenkins, Git, Terraform, kubectl on the instance
-  - `README.md` — (small message present in repo)
-- eks/
-  - `provider.tf` — AWS provider config (aws = 6.28.0)
-  - `backend.tf` — S3 backend config (bucket: `terraform-jenkins-eks-project`, key: `eks/terraform.tfstate`)
-  - `main.tf` — VPC + EKS module configuration (terraform-aws-modules/eks/aws)
-  - `variables.tf` — variables including vpc_cidr, public/private subnets
-  - `terraform.tfvars` — example var values for EKS stack
-  - `data.tf` — availability zones data source
+This repository aims to convert manual, error-prone steps into a single reproducible workflow so teams can focus on delivering software — not maintaining infrastructure.
 
----
-
-## Architecture overview
-
-This repository separates concerns into 2 independent Terraform deployments:
-
-1. Jenkins (EC2-based)
-   - Uses `terraform-aws-modules/vpc/aws` for VPC and public subnet(s)
-   - Creates a Security Group allowing HTTP (8080/8090) and SSH and egress as required
-   - Provisions an EC2 instance with `user_data` that runs `jenkins-install.sh` on boot to install Jenkins, Git, Terraform, and kubectl
-
-2. EKS (Kubernetes cluster)
-   - Uses `terraform-aws-modules/vpc/aws` for VPC and `terraform-aws-modules/eks/aws` for the EKS cluster
-   - Deploys managed node groups (example instance type: `t2.small`, configurable)
-   - Private and public subnets defined for cluster placement
-
-These stacks can be used independently (e.g., run just Jenkins provisioning or just EKS), but the repository aims to enable a CI/CD pipeline that uses Jenkins (on EC2) to operate on workloads deployed to EKS.
+Table of contents
+- Overview
+- Architecture
+- Prerequisites
+- Quickstart (full automated flow)
+- Useful commands & Terraform variables
+- Jenkins setup & pipeline examples
+- Destroy / clean up
+- Time-savings estimate
+- Cost considerations
+- Troubleshooting
+- Contributing & License
 
 ---
 
-## Prerequisites
+Overview
+--------
+This project provisions an entire CI/CD platform (Jenkins) on AWS EKS using Terraform and Helm. The goal is:
+- Reproducibility: one set of Terraform files that create identical environments
+- Speed: deploy end-to-end CI/CD infrastructure quickly
+- Maintainability: manage infra in code and track changes in Git
+- Best practices: least-privilege IAM, isolated network, secure secrets (recommend using SSM/Secrets Manager)
 
-- An AWS account with permissions to create IAM roles, EC2, VPC, EKS, S3 (for state backend), and related resources.
-- Terraform installed (recommended 1.4+ — check compatibility with modules; provider pinned: aws = 6.28.0).
-- AWS CLI installed (for authentication and kubeconfig setup).
-- kubectl (for interacting with EKS).
-- A pre-created EC2 key pair if you intend to SSH to the Jenkins instance (the Terraform config references `key_name = "jenkins-server-key"` — update as needed).
-- Create the S3 backend bucket(s) or change backend settings before running `terraform init` (see [Backends and state](#backends-and-state)).
+Architecture
+------------
+ASCII diagram (high-level):
 
-Environment notes:
-- Set AWS credentials via environment variables, shared profile, or IAM role on a dev machine:
-  - `export AWS_PROFILE=your-profile`
-  - `export AWS_REGION=us-east-1` (the Terraform provider files set `region = "us-east-1"`)
+```
+                       ┌────────────┐
+                       │   Developer│
+                       └──────┬─────┘
+                              │
+                              │ git push / trigger
+                              ▼
+                      ┌─────────────────┐
+                      │   Jenkins Master│
+                      │  (Helm on EKS)  │
+                      └─────┬──────┬────┘
+                            │      │
+            ┌───────────────┘      └───────────────┐
+            │                                      │
+     ┌────────────┐                         ┌────────────┐
+     │K8s Agents / │                         │  ECR / S3  │
+     │ Kubernetes  │                         │  Artifact  │
+     │  pods       │                         │  Storage   │
+     └────────────┘                         └────────────┘
+            │
+            ▼
+      Build -> Test -> Push -> Deploy -> EKS
+```
 
----
+Prerequisites
+-------------
+- AWS account with permission to create: VPC, EKS, IAM, EC2, ECR, S3 (for remote state), CloudWatch
+- Local:
+  - Terraform v1.2+ (matching provider requirements in repo)
+  - AWS CLI configured (aws configure)
+  - kubectl
+  - helm
+  - jq (optional, for quick JSON handling)
+  - A Git client
+- Optional but recommended:
+  - An S3 bucket + DynamoDB table for Terraform remote state locking
+  - AWS IAM user / role for automation with programmatic keys
+  - Docker (for local image builds)
 
-## Important files and what they do
+Quickstart — deploy everything (recommended)
+-------------------------------------------
+1. Clone the repo
+```bash
+git clone https://github.com/AnirbanB13/terraform-jenkins-eks-cicd.git
+cd terraform-jenkins-eks-cicd
+```
 
-- terraform_jenkins_eks/provider.tf
-  - Specifies the AWS provider version (6.28.0) and region `us-east-1`.
-- terraform_jenkins_eks/backend.tf
-  - Configures S3 backend:
-    - bucket: `terraform-jenkins-eks-project`
-    - key: `jenkins/terraform.tfstate`
-    - region: `us-east-1`
-- terraform_jenkins_eks/jenkins-install.sh
-  - Bash script that installs Jenkins, Git, Terraform, and kubectl on Amazon Linux 2 (uses yum, installs OpenJDK 11, Jenkins package repo).
-- terraform_jenkins_eks/main.tf
-  - Creates VPC, security group, and EC2 instance; the EC2 module uses `user_data = file("jenkins-install.sh")`.
-- eks/backend.tf
-  - Configures S3 backend:
-    - bucket: `terraform-jenkins-eks-project`
-    - key: `eks/terraform.tfstate`
-- eks/main.tf
-  - Creates a VPC and an EKS cluster using the `terraform-aws-modules/eks/aws` module with managed node groups
-  - Example kubernetes_version set to `1.33` (adjust to a supported version in your account/region)
+2. Configure AWS credentials and variables
+```bash
+export AWS_PROFILE=your-aws-profile
+export AWS_REGION=us-east-1
+# Optional overrides:
+export TF_VAR_cluster_name=my-jenkins-eks
+export TF_VAR_admin_email=you@example.com
+```
 
----
+3. (Optional) Configure remote state (S3 + DynamoDB). Example backend config:
+- Create S3 bucket for state and DynamoDB table for locks, then update backend config or set backend variables.
 
-## Quick start — Jenkins EC2 deployment
+4. Initialize Terraform
+```bash
+terraform init -backend-config="bucket=your-terraform-state-bucket" \
+               -backend-config="key=jenkins-eks/terraform.tfstate" \
+               -backend-config="region=${AWS_REGION}"
+```
 
-1. Prepare backend (S3) and ensure the bucket exists:
-   - Create S3 bucket `terraform-jenkins-eks-project` (or update `backend.tf` to your bucket).
-   - Optionally enable versioning and encryption on the backend bucket.
+5. Validate and plan
+```bash
+terraform validate
+terraform plan -out=tfplan
+```
 
-2. Change to the Jenkins terraform directory:
-   - `cd terraform_jenkins_eks`
+6. Apply (this provisions infra + Jenkins via Helm)
+```bash
+terraform apply "tfplan"
+# or
+terraform apply -auto-approve
+```
 
-3. Customize variables:
-   - Edit `terraform.tfvars` or provide overrides via `-var` or environment variables.
-   - Ensure `instance_type`, `vpc_cidr`, and `public_subnets` are as desired.
+7. Wait for outputs and retrieve Jenkins URL & initial admin password
+```bash
+terraform output -json
+# Example output keys: jenkins_url, kubeconfig, cluster_name
+```
+Then
+```bash
+kubectl get svc --namespace jenkins
+# or open the jenkins_url in your browser
+```
 
-4. Initialize and apply:
-   - `terraform init`
-   - `terraform plan -out plan.tfplan`
-   - `terraform apply "plan.tfplan"`
+Estimated runtime for full automated deployment:
+- Terraform provisioning (VPC, EKS, IAM): 10–30 minutes (typical, depending on region and node provisioning)
+- EKS node readiness + Helm install for Jenkins: 5–20 minutes
+- Jenkins initialization & plugin install: 2–15 minutes
+Total: roughly 20–65 minutes end-to-end (varies by AWS region, selected instance types, and network speed).
 
-5. After apply completes:
-   - Note the EC2 public IP — Jenkins will be available on port `8080` (or ports allowed by the SG).
-   - The `jenkins-install.sh` script runs as user-data and will install Jenkins and start the service.
-   - SSH into the instance if needed (ensure your `key_name` exists in the region).
+Useful Terraform variables & common settings
+-------------------------------------------
+- TF_VAR_cluster_name — name of the EKS cluster
+- TF_VAR_region — AWS region
+- TF_VAR_node_group_instance_types — e.g., ["t3.medium"]
+- TF_VAR_desired_capacity, min_size, max_size — node group scaling
+- TF_VAR_jenkins_helm_values — path to a helm values.yaml (if exposed)
 
-6. Initial Jenkins setup:
-   - Connect to `http://<ec2-public-ip>:8080` and follow Jenkins initial setup.
-   - Install recommended plugins and create an admin user.
+Example override via var file (dev.tfvars):
+```hcl
+cluster_name = "my-jenkins-eks"
+region = "us-east-1"
+node_instance_types = ["t3.medium"]
+jenkins_admin_user = "admin"
+jenkins_admin_password = "ChangeMe123!"
+```
 
----
+Then:
+```bash
+terraform plan -var-file="dev.tfvars"
+terraform apply -var-file="dev.tfvars"
+```
 
-## Quick start — EKS cluster deployment
+Jenkins setup and best practices
+-------------------------------
+- This repo deploys Jenkins via Helm to the EKS cluster. The Helm chart can be configured using a values YAML file (plugins list, admin user, ingress, persistence).
+- Recommended Jenkins configuration:
+  - Use Kubernetes plugin to spawn ephemeral agents
+  - Store secrets in AWS Secrets Manager or Kubernetes Secrets encrypted
+  - Use Jenkins Configuration as Code (JCasC) to seed jobs and plugins automatically
+  - Integrate with ECR / Docker registry credentials and set up service accounts
 
-1. Prepare backend S3 bucket or reuse the same bucket but different `key` in `eks/backend.tf`.
+Destroy / clean up
+------------------
+To remove everything provisioned by Terraform:
+```bash
+terraform destroy -auto-approve
+```
+Make sure you have the correct Terraform workspace and remote state configured — destroying will remove infra and possibly data in ECR / persistent volumes.
 
-2. Change to the EKS terraform directory:
-   - `cd eks`
+Time-savings estimate (Manual vs IaC)
+-------------------------------------
+The intent of this section is to give a practical sense of time saved by using this repository versus manual setup.
 
-3. Customize variables in `eks/terraform.tfvars`:
-   - Set `vpc_cidr`, `private_subnets`, `public_subnets` as appropriate for your network design.
+Estimated manual time (typical experienced engineer):
+- Networking + VPC: 1–2 hours
+- EKS cluster (console/eksctl) + nodegroups + IAM roles: 1–3 hours (including troubleshooting)
+- Configure Jenkins cluster (helm/chart, ingress, persistent volumes): 1–2 hours
+- Jenkins admin config, plugin installs, agent config, ECR credential setup: 1–3 hours
+Total manual: 4–10 hours (could be longer for teams unfamiliar with EKS/Jenkins)
 
-4. Initialize and apply:
-   - `terraform init`
-   - `terraform plan -out eks-plan.tfplan`
-   - `terraform apply "eks-plan.tfplan"`
+Automated (this IaC repo):
+- Prepare variables, state, credentials: 10–30 minutes
+- Run terraform & helm to provision + Jenkins bootstrap: 20–65 minutes
+Total automated: 30–95 minutes
 
-5. Configure kubectl to use the created cluster:
-   - After Terraform creates the EKS cluster, run:
-     - `aws eks update-kubeconfig --region us-east-1 --name my-eks-cluster`
-   - Validate:
-     - `kubectl get nodes`
-     - `kubectl get pods -A`
+Conservative time saved: 3–9 hours per environment bootstrap.
+In many cases, repeated provisioning (staging/qa/prod per team) multiplies savings. If you do this repeatedly (or recover after incidents), IaC saves both time and error risk.
 
-Notes:
-- The example config uses managed node groups with `instance_type = ["t2.small"]`. Adjust instance types and scaling settings as needed.
-- Check the `kubernetes_version` value in `eks/main.tf` and change to a region-supported version if required.
+Cost considerations
+-------------------
+- Running EKS node groups and Jenkins workers costs EC2 instance-hours. Use spot instances for build agents to reduce cost.
+- Always review persistent storage (EBS/PV) and load balancer costs.
+- Terraform state S3 and DynamoDB have minimal costs; ECR storage is billed.
+- Tip: During development, choose smaller instance types (t3.small/medium) or use Fargate to minimize cost.
 
----
+Troubleshooting & FAQ
+---------------------
+- Jenkins pods not scheduling? Check node taints/tolerations, resource requests, and node group capacity.
+- Helm release failing? Run `helm status <release> -n jenkins` and check `kubectl logs` for the pods.
+- Terraform Apply hangs on EKS node creation? Node provisioning in certain regions can take longer; check EC2 quotas and AZ capacity.
+- Need to rotate Jenkins admin password? Prefer JCasC or Secret Manager integration; avoid committing plain text credentials.
 
-## Common Terraform commands
+Contributing
+------------
+Contributions, suggestions, and improvements are welcome!
+- Open an issue if you hit a problem or want a feature
+- Fork the repo and open a pull request for fixes or enhancements
+- Follow repository conventions and include tests where applicable
 
-- Initialize working directory:
-  - `terraform init`
-- Validate:
-  - `terraform validate`
-- Create plan:
-  - `terraform plan -out plan.tfplan`
-- Apply:
-  - `terraform apply "plan.tfplan"`
-- Destroy (clean up resources):
-  - `terraform destroy`
-  - Or `terraform plan -destroy -out destroy.tfplan && terraform apply "destroy.tfplan"`
-
----
-
-## Variables and customization
-
-Examples found in repo:
-
-- terraform_jenkins_eks/terraform.tfvars
-  - vpc_cidr = "10.0.0.0/16"
-  - public_subnets = ["10.0.1.0/24"]
-  - instance_type = "t2.micro"
-
-- eks/terraform.tfvars
-  - vpc_cidr = "192.168.0.0/16"
-  - private_subnets = ["192.168.1.0/24", "192.168.2.0/24", "192.168.3.0/24"]
-  - public_subnets  = ["192.168.4.0/24", "192.168.5.0/24", "192.168.6.0/24"]
-
-When customizing:
-- Keep subnet CIDR ranges non-overlapping with your existing network to avoid routing issues.
-- Update EC2 `key_name` to an existing key pair in your AWS account (`jenkins-server-key` is referenced in the EC2 module).
-- Consider tagging and naming conventions to track resources.
-
----
-
-## Backends and state
-
-Both stacks are configured to use S3 backends in `backend.tf`:
-- Bucket: `terraform-jenkins-eks-project`
-- Keys:
-  - Jenkins stack: `jenkins/terraform.tfstate`
-  - EKS stack: `eks/terraform.tfstate`
-
-Before running `terraform init`:
-- Create the S3 bucket and an optional DynamoDB table for state locking (recommended).
-- Or change `backend.tf` to point to your own bucket and lock table.
-
-Example to create DynamoDB lock table:
-- Table name: `terraform-locks`
-- Primary key: `LockID` (string)
-
----
-
-## Security, costs, and cleanup
-
-Security:
-- Do not commit AWS credentials to Git. Use environment variables, AWS profiles, or IAM roles.
-- Secure the Jenkins server:
-  - Limit Security Group access to trusted IPs for SSH and the Jenkins web UI.
-  - Use HTTPS for Jenkins (set up a reverse proxy + certificate).
-  - Rotate credentials and lock down IAM policies for any instance profiles or roles you attach.
-
-Costs:
-- EC2 instances, EKS cluster control plane and worker nodes, NAT gateways, and other AWS resources will incur costs.
-- EKS control plane is billed by AWS; monitor the cluster when testing.
-- Use small instance types for development (example uses `t2.micro` and `t2.small`), but be mindful of AWS free-tier limits and availability.
-
-Cleanup:
-- Run `terraform destroy` in each directory (after setting proper AWS credentials) to remove resources.
-- Manually verify that S3 backend states and any created S3 buckets / DynamoDB tables are handled according to your policies.
-
----
-
-## Troubleshooting and tips
-
-- If propagation issues or resource limits occur, increase timeouts or re-run `terraform apply`.
-- EKS version mismatch:
-  - The repo references `kubernetes_version = "1.33"` — replace with a supported Kubernetes version for your AWS region (e.g., `1.27`/`1.28` etc.) before applying if `1.33` is not supported yet.
-- If `jenkins-install.sh` fails:
-  - SSH into the instance and inspect logs: `sudo journalctl -u jenkins` and system logs.
-  - Confirm the instance has internet access (NAT or public IP) to download packages.
-- Backend initialization errors:
-  - Ensure the S3 bucket exists and the executing IAM principal has `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, and if using DynamoDB locking, the appropriate DynamoDB permissions.
-
----
-
-## Next steps / Recommendations
-
-- Integrate Jenkins with EKS:
-  - Either run Jenkins agents inside the EKS cluster (Kubernetes plugin) or configure Jenkins to deploy to the EKS cluster via kubectl/helm.
-- Add CI pipeline examples:
-  - Create example Jenkins pipelines (Jenkinsfile) that demonstrate building Docker images and deploying to EKS.
-- Modularize more:
-  - Break down the Terraform into reusable modules (VPC module reused across stacks).
-- Add automated tests:
-  - Use infrastructure testing frameworks (e.g., Terratest) or CI (GitHub Actions) to validate Terraform plan/validate.
-- Improve security:
-  - Use IAM roles for service accounts (IRSA) for pods on EKS, use least privilege IAM policies for Jenkins.
-
----
-
-## Contributing
-
-Contributions are welcome. Suggested workflow:
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feat/my-change`
-3. Make changes, add documentation or tests.
-4. Open a pull request describing the change and usage details.
-
-Please ensure:
-- Sensitive information is never committed.
-- Terraform code is formatted: `terraform fmt`.
-- Modules are validated: `terraform validate`.
-
----
-
-## License & contact
-
-- This repository does not include a LICENSE file in the current tree. Add a license of your choice if you intend to open-source it (e.g., MIT, Apache-2.0).
-- Questions or issues: open an issue in the GitHub repository.
+License
+-------
+This repository is provided under the MIT License. See LICENSE for details.
